@@ -264,9 +264,14 @@ def download_and_parse_rdd2022(
             config["url"],
             stream=True,
             timeout=(30, 180),
-            headers={"User-Agent": "RoadGraphAI-Student-Project/1.0"},
+            headers={"User-Agent": "Mozilla/5.0"},
         )
-        response.raise_for_status()
+        
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"RDD2022 download failed ({response.status_code}): "
+                f"{response.text[:500]}"
+            )
         total_bytes = int(response.headers.get("content-length") or 0)
         max_bytes = 650 * 1024 * 1024
         if total_bytes and total_bytes > max_bytes:

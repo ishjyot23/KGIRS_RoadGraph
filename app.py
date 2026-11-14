@@ -63,6 +63,17 @@ COUNTRY_ARCHIVES = {
     "China Drone": {"country": "China Drone", "folder": "China_Drone"},
 }
 
+# ZIP paths can vary slightly between mirrors/build tools (for example,
+# backslashes, a prefixed root folder, or a folder named "Czech Republic").
+# These aliases make country selection independent of those variations.
+COUNTRY_FOLDER_ALIASES = {
+    "Czech Republic": ("czech", "czech republic", "czechia"),
+    "India": ("india",),
+    "United States": ("united states", "usa"),
+    "China MotorBike": ("china motorbike", "motorbike", "motor bike"),
+    "China Drone": ("china drone", "drone"),
+}
+
 # Compact domain reference documents form the initial road-maintenance
 # knowledge base. They are explanatory project references, not official
 # engineering specifications or a substitute for a local road authority.
@@ -424,45 +435,136 @@ def download_and_parse_rdd2022(
         archive = zipfile.ZipFile(remote_zip, "r")
 
         all_infos = [info for info in archive.infolist() if not info.is_dir()]
+        country_aliases = tuple(
+            re.sub(r"\s+", " ", alias.replace("_", " ").replace("-", " ").casefold()).strip()
+            for alias in COUNTRY_FOLDER_ALIASES.get(country, (country_folder,))
+        )
 
-        def is_selected_country_train_file(info) -> bool:
-            parts = {part.lower() for part in PurePosixPath(info.filename).parts}
-            return country_folder in parts and "train" in parts
+        def normalise_member_path(filename: str) -> tuple[str, ...]:
+            # Some ZIP producers store Windows separators; zipfile does not
+            # automatically convert those into POSIX path components.
+            cleaned = filename.replace("\\", "/").strip("/")
+            return tuple(part for part in cleaned.split("/") if part and part != ".")
 
-        country_infos = [info for info in all_infos if is_selected_country_train_file(info)]
-        images_by_stem: dict[str, zipfile.ZipInfo] = {}
+        def contains_alias(path_text: str) -> bool:
+            """Match a country name anywhere in a normalized ZIP member path."""
+            normalised = re.sub(r"[^a-z0-9]+", " ", path_text.casefold()).strip()
+            padded = f" {normalised} "
+            return any(f" {alias} " in padded for alias in country_aliases)
+
+        path_parts_by_name = {
+            info.filename: normalise_member_path(info.filename) for info in all_infos
+        }
+
+        def is_selected_country_file(info) -> bool:
+            parts = path_parts_by_name[info.filename]
+            # Include the filename too: some mirrors encode the country in the
+            # filename rather than preserving the country directory.
+            return contains_alias("/".join(parts))
+
+        country_infos = [info for info in all_infos if is_selected_country_file(info)]
+
+        def file_suffix(info) -> str:
+            return PurePosixPath("/".join(path_parts_by_name[info.filename])).suffix.lower()
+
+        def canonical_stem(info) -> str:
+            """Return a case-insensitive stem, including names such as x.jpg.xml."""
+            name = PurePosixPath("/".join(path_parts_by_name[info.filename])).name.casefold()
+            if name.endswith(".xml"):
+                name = name[:-4]
+                if name.endswith((".jpg", ".jpeg")):
+                    name = PurePosixPath(name).stem
+            else:
+                name = PurePosixPath(name).stem
+            return name
+
+        image_infos = [info for info in country_infos if file_suffix(info) in {".jpg", ".jpeg"}]
+        xml_infos = [info for info in country_infos if file_suffix(info) == ".xml"]
+
+        images_by_stem: dict[str, list[zipfile.ZipInfo]] = {}
         images_by_basename: dict[str, list[zipfile.ZipInfo]] = {}
-        for info in country_infos:
-            suffix = PurePosixPath(info.filename).suffix.lower()
-            if suffix in {".jpg", ".jpeg"}:
-                stem_key = str(PurePosixPath(info.filename).with_suffix("")).lower()
-                images_by_stem[stem_key] = info
-                images_by_basename.setdefault(PurePosixPath(info.filename).stem.lower(), []).append(info)
+        for info in image_infos:
+            path = "/".join(path_parts_by_name[info.filename]).casefold()
+            stem_path = str(PurePosixPath(path).with_suffix(""))
+            images_by_stem.setdefault(stem_path, []).append(info)
+            images_by_basename.setdefault(canonical_stem(info), []).append(info)
 
-        xml_infos = [
-            info for info in country_infos
-            if PurePosixPath(info.filename).suffix.lower() == ".xml"
-        ]
-        xml_infos.sort(key=lambda info: info.filename.lower())
+        xml_infos.sort(key=lambda info: info.filename.casefold())
+
+        def choose_image_for_xml(xml_info):
+            xml_path = "/".join(path_parts_by_name[xml_info.filename]).casefold()
+            exact_stem = str(PurePosixPath(xml_path).with_suffix(""))
+            exact_matches = images_by_stem.get(exact_stem, [])
+            if len(exact_matches) == 1:
+                return exact_matches[0]
+
+            basename_matches = images_by_basename.get(canonical_stem(xml_info), [])
+            if len(basename_matches) == 1:
+                return basename_matches[0]
+            if basename_matches:
+                # Resolve duplicated basenames by preferring the image whose
+                # path shares the most directory components with the XML path.
+                xml_parts = path_parts_by_name[xml_info.filename][:-1]
+                scored = []
+                for image_info in basename_matches:
+                    image_parts = path_parts_by_name[image_info.filename][:-1]
+                    common = 0
+                    for left, right in zip(xml_parts, image_parts):
+                        if left.casefold() != right.casefold():
+                            break
+                        common += 1
+                    scored.append((common, image_info))
+                scored.sort(key=lambda item: item[0], reverse=True)
+                if len(scored) == 1 or scored[0][0] > scored[1][0]:
+                    return scored[0][1]
+
+            # Last-resort pairing uses Pascal VOC's <filename> element. Some
+            # releases have XML filenames that differ from the XML member name.
+            try:
+                root = ET.fromstring(archive.read(xml_info))
+                annotation_filename = (root.findtext("filename") or "").strip()
+                if annotation_filename:
+                    target = PurePosixPath(annotation_filename.replace("\\", "/")).name.casefold()
+                    candidates = [
+                        image for image in image_infos
+                        if PurePosixPath("/".join(path_parts_by_name[image.filename])).name.casefold() == target
+                    ]
+                    if len(candidates) == 1:
+                        return candidates[0]
+            except Exception:
+                pass
+            return None
 
         selected_pairs = []
+        used_images = set()
         for xml_info in xml_infos:
-            stem_key = str(PurePosixPath(xml_info.filename).with_suffix("")).lower()
-            image_info = images_by_stem.get(stem_key)
-            if image_info is None:
-                basename = PurePosixPath(xml_info.filename).stem.lower()
-                matches = images_by_basename.get(basename, [])
-                if len(matches) == 1:
-                    image_info = matches[0]
-            if image_info is not None:
+            image_info = choose_image_for_xml(xml_info)
+            if image_info is not None and image_info.filename not in used_images:
                 selected_pairs.append((xml_info, image_info))
+                used_images.add(image_info.filename)
             if len(selected_pairs) >= max_images:
                 break
 
         if not selected_pairs:
+            # Surface real ZIP member names to make any remaining layout issue diagnosable.
+            media_examples = [
+                info.filename for info in all_infos
+                if PurePosixPath(info.filename.replace("\\", "/")).suffix.lower()
+                in {".jpg", ".jpeg", ".xml"}
+            ][:30]
+            country_examples = [info.filename for info in country_infos[:20]]
+            top_level_folders = sorted({
+                path_parts_by_name[info.filename][0]
+                for info in all_infos if path_parts_by_name[info.filename]
+            })
             raise RuntimeError(
-                f"No JPEG/XML training pairs were found under the '{config['folder']}' folder "
-                "in the Figshare archive. Check the dataset's ZIP directory structure."
+                f"No JPEG/XML training pairs could be matched for {country}. "
+                f"Figshare ZIP entries: {len(all_infos)}; country-path matches: {len(country_infos)}; "
+                f"JPEGs: {len(image_infos)}; XMLs: {len(xml_infos)}. "
+                f"Country path examples: {country_examples or 'none'}. "
+                f"Image/XML path examples: {media_examples or 'none'}. "
+                f"Top-level folders: {top_level_folders[:20]}. "
+                "The ZIP structure is shown above so the country mapping can be corrected precisely."
             )
 
         docs: list[dict[str, Any]] = []
@@ -921,6 +1023,7 @@ def safe_rerun():
 st.title("RoadGraph AI")
 st.subheader("An ontology-guided GraphRAG prototype for road damage and maintenance")
 st.caption("RDD2022 annotations + domain knowledge → vector retrieval + Knowledge Graph → evidence-grounded answers")
+st.caption("Parser build: 2026-11-15 | country-path and Pascal VOC filename matching")
 
 with st.sidebar:
     st.header("Build the knowledge base")

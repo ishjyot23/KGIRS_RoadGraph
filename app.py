@@ -1,17 +1,19 @@
 """RoadGraph AI: Streamlit GraphRAG application over RDD2022.
 
 The app reads a bounded sample of a selected country's annotated training
-images/XML files from the public Figshare ZIP using HTTP byte-range requests.
+images/XML files from the nested country ZIP inside the public Figshare archive.
 It builds a text corpus, embeds chunks in an in-memory Chroma vector database,
-constructs a NetworkX knowledge graph, and answers questions using retrieved
-context plus graph-neighbour evidence.
+constructs a NetworkX knowledge graph, and produces evidence-grounded answers
+without requiring an external LLM API key.
 """
 
 from __future__ import annotations
 
 import io
-import os
 import re
+import shutil
+import struct
+import tempfile
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -49,9 +51,9 @@ DAMAGE_NAMES = {
     "D40": "Pothole",
 }
 
-# RDD2022 is hosted on Figshare as one combined ZIP archive. The app uses
-# HTTP byte-range requests to read only the selected country's train files; it
-# does not download the 13+ GB archive in full.
+# Figshare publishes one combined ZIP containing separate country ZIP files.
+# The app opens only the selected nested country ZIP; it never downloads the
+# 13+ GB combined archive in full.
 FIGSHARE_API_URL = "https://api.figshare.com/v2/articles/21431547"
 FIGSHARE_ARCHIVE_NAME = "RDD2022_released_through_CRDDC2022.zip"
 
@@ -300,6 +302,110 @@ class HTTPRangeReader:
             self.session.close()
 
 
+
+class ZipMemberRangeReader:
+    """Seekable view of an uncompressed member inside a remote ZIP file.
+
+    The outer Figshare ZIP stores country ZIPs as individual members. When a
+    member is ZIP_STORED, this reader exposes its byte range directly, allowing
+    the inner ZIP central directory and selected files to be fetched remotely.
+    Closing this view never closes the parent HTTPRangeReader.
+    """
+
+    def __init__(self, parent: HTTPRangeReader, start: int, size: int):
+        self.parent = parent
+        self.start = int(start)
+        self.size = int(size)
+        self.position = 0
+        self.closed = False
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            new_position = offset
+        elif whence == 1:
+            new_position = self.position + offset
+        elif whence == 2:
+            new_position = self.size + offset
+        else:
+            raise ValueError("Invalid seek mode")
+        if new_position < 0:
+            raise ValueError("Negative seek position")
+        self.position = min(new_position, self.size)
+        return self.position
+
+    def tell(self) -> int:
+        return self.position
+
+    def read(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("I/O operation on closed ZIP member reader")
+        if self.position >= self.size:
+            return b""
+        if size is None or size < 0:
+            size = self.size - self.position
+        size = min(size, self.size - self.position)
+        self.parent.seek(self.start + self.position)
+        data = self.parent.read(size)
+        self.position += len(data)
+        return data
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _zip_member_data_offset(zip_file: zipfile.ZipFile, info: zipfile.ZipInfo) -> int:
+    """Return the first data byte for a ZIP member using its local header."""
+    fp = zip_file.fp
+    if fp is None:
+        raise RuntimeError("The outer Figshare ZIP is already closed.")
+    current = fp.tell()
+    try:
+        fp.seek(info.header_offset)
+        header = fp.read(30)
+        if len(header) != 30 or header[:4] != b"PK\x03\x04":
+            raise RuntimeError(f"Invalid local ZIP header for {info.filename}")
+        fields = struct.unpack("<IHHHHHIIIHH", header)
+        filename_length = fields[-2]
+        extra_length = fields[-1]
+        return info.header_offset + 30 + filename_length + extra_length
+    finally:
+        fp.seek(current)
+
+
+def _open_nested_country_zip(
+    outer_zip: zipfile.ZipFile,
+    country_info: zipfile.ZipInfo,
+) -> tuple[zipfile.ZipFile, Any | None, str]:
+    """Open a country ZIP without downloading the combined Figshare archive.
+
+    For a ZIP_STORED outer member, a direct byte-range view is used. If Figshare
+    compresses the nested ZIP member, only that selected country member is
+    streamed into a temporary spool file (never the complete outer archive).
+    """
+    if country_info.compress_type == zipfile.ZIP_STORED:
+        data_offset = _zip_member_data_offset(outer_zip, country_info)
+        member_reader = ZipMemberRangeReader(outer_zip.fp, data_offset, country_info.file_size)
+        return zipfile.ZipFile(member_reader, "r"), member_reader, "HTTP range access"
+
+    # A compressed nested ZIP cannot be randomly accessed until decompressed.
+    # Keep the first 64 MiB in memory; larger selected-country files spill to
+    # Streamlit's temporary disk rather than the process memory limit.
+    spool = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b")
+    try:
+        with outer_zip.open(country_info, "r") as source:
+            shutil.copyfileobj(source, spool, length=4 * 1024 * 1024)
+        spool.seek(0)
+        return zipfile.ZipFile(spool, "r"), spool, "selected-country temporary spool"
+    except Exception:
+        spool.close()
+        raise
+
 def get_figshare_archive_metadata() -> dict[str, Any]:
     """Resolve the public combined RDD2022 ZIP from the Figshare article API."""
     try:
@@ -418,57 +524,73 @@ def download_and_parse_rdd2022(
     max_images: int,
     progress_callback=None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Read a bounded sample from one country folder in the remote RDD2022 ZIP.
+    """Read a bounded sample from the selected nested country ZIP in Figshare.
 
-    Only HTTP byte ranges containing the ZIP directory and selected XML/JPEG
-    members are fetched. The full combined archive is never downloaded.
+    The Figshare article contains a 13+ GB outer ZIP with country-specific ZIP
+    members such as ``RDD2022/Czech.zip``. This function first locates the
+    selected country ZIP, opens that nested ZIP, then pairs training JPEGs with
+    Pascal VOC XML files by filename stem. Only the selected country's subset
+    is accessed; unrelated country subsets are not downloaded.
     """
     config = COUNTRY_ARCHIVES[archive_label]
     country = config["country"]
-    country_folder = config["folder"].lower()
     remote_zip = None
-    archive = None
+    outer_archive = None
+    country_archive = None
+    country_archive_backing = None
 
     try:
         file_metadata = get_figshare_archive_metadata()
         remote_zip = HTTPRangeReader(file_metadata["download_url"])
-        archive = zipfile.ZipFile(remote_zip, "r")
+        outer_archive = zipfile.ZipFile(remote_zip, "r")
+        outer_infos = [info for info in outer_archive.infolist() if not info.is_dir()]
 
-        all_infos = [info for info in archive.infolist() if not info.is_dir()]
-        country_aliases = tuple(
-            re.sub(r"\s+", " ", alias.replace("_", " ").replace("-", " ").casefold()).strip()
-            for alias in COUNTRY_FOLDER_ALIASES.get(country, (country_folder,))
+        def token(value: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+        aliases = set(COUNTRY_FOLDER_ALIASES.get(country, (config.get("folder", country),)))
+        aliases.add(config.get("folder", country))
+        alias_tokens = {token(alias) for alias in aliases if token(alias)}
+
+        country_zip_candidates = []
+        for info in outer_infos:
+            member_path = info.filename.replace("\\", "/")
+            member = PurePosixPath(member_path)
+            if member.suffix.lower() != ".zip":
+                continue
+            if token(member.stem) in alias_tokens:
+                country_zip_candidates.append(info)
+
+        if len(country_zip_candidates) != 1:
+            available_zips = [
+                info.filename for info in outer_infos
+                if PurePosixPath(info.filename.replace("\\", "/")).suffix.lower() == ".zip"
+            ]
+            raise RuntimeError(
+                f"Could not uniquely locate the {country} nested ZIP in Figshare. "
+                f"Matching candidates: {[x.filename for x in country_zip_candidates]}. "
+                f"Country ZIPs in the outer archive: {available_zips}."
+            )
+
+        country_zip_info = country_zip_candidates[0]
+        country_archive, country_archive_backing, access_mode = _open_nested_country_zip(
+            outer_archive, country_zip_info
         )
 
+        all_infos = [info for info in country_archive.infolist() if not info.is_dir()]
+
         def normalise_member_path(filename: str) -> tuple[str, ...]:
-            # Some ZIP producers store Windows separators; zipfile does not
-            # automatically convert those into POSIX path components.
             cleaned = filename.replace("\\", "/").strip("/")
             return tuple(part for part in cleaned.split("/") if part and part != ".")
-
-        def contains_alias(path_text: str) -> bool:
-            """Match a country name anywhere in a normalized ZIP member path."""
-            normalised = re.sub(r"[^a-z0-9]+", " ", path_text.casefold()).strip()
-            padded = f" {normalised} "
-            return any(f" {alias} " in padded for alias in country_aliases)
 
         path_parts_by_name = {
             info.filename: normalise_member_path(info.filename) for info in all_infos
         }
 
-        def is_selected_country_file(info) -> bool:
-            parts = path_parts_by_name[info.filename]
-            # Include the filename too: some mirrors encode the country in the
-            # filename rather than preserving the country directory.
-            return contains_alias("/".join(parts))
-
-        country_infos = [info for info in all_infos if is_selected_country_file(info)]
-
         def file_suffix(info) -> str:
             return PurePosixPath("/".join(path_parts_by_name[info.filename])).suffix.lower()
 
         def canonical_stem(info) -> str:
-            """Return a case-insensitive stem, including names such as x.jpg.xml."""
             name = PurePosixPath("/".join(path_parts_by_name[info.filename])).name.casefold()
             if name.endswith(".xml"):
                 name = name[:-4]
@@ -478,8 +600,10 @@ def download_and_parse_rdd2022(
                 name = PurePosixPath(name).stem
             return name
 
-        image_infos = [info for info in country_infos if file_suffix(info) in {".jpg", ".jpeg"}]
-        xml_infos = [info for info in country_infos if file_suffix(info) == ".xml"]
+        # XMLs are the labelled training records. Test images have no XML and
+        # therefore are not included in the retrieval corpus.
+        image_infos = [info for info in all_infos if file_suffix(info) in {".jpg", ".jpeg"}]
+        xml_infos = [info for info in all_infos if file_suffix(info) == ".xml"]
 
         images_by_stem: dict[str, list[zipfile.ZipInfo]] = {}
         images_by_basename: dict[str, list[zipfile.ZipInfo]] = {}
@@ -502,8 +626,6 @@ def download_and_parse_rdd2022(
             if len(basename_matches) == 1:
                 return basename_matches[0]
             if basename_matches:
-                # Resolve duplicated basenames by preferring the image whose
-                # path shares the most directory components with the XML path.
                 xml_parts = path_parts_by_name[xml_info.filename][:-1]
                 scored = []
                 for image_info in basename_matches:
@@ -518,10 +640,9 @@ def download_and_parse_rdd2022(
                 if len(scored) == 1 or scored[0][0] > scored[1][0]:
                     return scored[0][1]
 
-            # Last-resort pairing uses Pascal VOC's <filename> element. Some
-            # releases have XML filenames that differ from the XML member name.
+            # Pascal VOC XML may contain the corresponding image filename.
             try:
-                root = ET.fromstring(archive.read(xml_info))
+                root = ET.fromstring(country_archive.read(xml_info))
                 annotation_filename = (root.findtext("filename") or "").strip()
                 if annotation_filename:
                     target = PurePosixPath(annotation_filename.replace("\\", "/")).name.casefold()
@@ -546,25 +667,21 @@ def download_and_parse_rdd2022(
                 break
 
         if not selected_pairs:
-            # Surface real ZIP member names to make any remaining layout issue diagnosable.
             media_examples = [
                 info.filename for info in all_infos
-                if PurePosixPath(info.filename.replace("\\", "/")).suffix.lower()
-                in {".jpg", ".jpeg", ".xml"}
+                if file_suffix(info) in {".jpg", ".jpeg", ".xml"}
             ][:30]
-            country_examples = [info.filename for info in country_infos[:20]]
-            top_level_folders = sorted({
+            folder_examples = sorted({
                 path_parts_by_name[info.filename][0]
                 for info in all_infos if path_parts_by_name[info.filename]
             })
             raise RuntimeError(
-                f"No JPEG/XML training pairs could be matched for {country}. "
-                f"Figshare ZIP entries: {len(all_infos)}; country-path matches: {len(country_infos)}; "
+                f"The nested {country} ZIP was opened ({country_zip_info.filename}), but no JPEG/XML "
+                f"training pairs could be matched. Inner ZIP entries: {len(all_infos)}; "
                 f"JPEGs: {len(image_infos)}; XMLs: {len(xml_infos)}. "
-                f"Country path examples: {country_examples or 'none'}. "
-                f"Image/XML path examples: {media_examples or 'none'}. "
-                f"Top-level folders: {top_level_folders[:20]}. "
-                "The ZIP structure is shown above so the country mapping can be corrected precisely."
+                f"Sample inner paths: {media_examples or 'none'}. "
+                f"Top-level folders: {folder_examples[:20]}. "
+                "Expected a train folder containing JPEG images and Pascal VOC XML annotations."
             )
 
         docs: list[dict[str, Any]] = []
@@ -572,7 +689,7 @@ def download_and_parse_rdd2022(
         total_class_counts: Counter = Counter()
 
         for index, (xml_info, image_info) in enumerate(selected_pairs):
-            xml_bytes = archive.read(xml_info)
+            xml_bytes = country_archive.read(xml_info)
             record = _xml_to_record(xml_bytes, xml_info.filename, country)
             record["id"] = f"RDD_{country.replace(' ', '_')}_{index:05d}_{record['id'][-50:]}"
             record["archive_image_path"] = image_info.filename
@@ -580,7 +697,7 @@ def download_and_parse_rdd2022(
             total_class_counts.update(record["counts"])
 
             if len(previews) < 12:
-                image_bytes = archive.read(image_info)
+                image_bytes = country_archive.read(image_info)
                 try:
                     preview_bytes = _draw_annotated_preview(image_bytes, record["objects"])
                     previews.append(
@@ -595,7 +712,6 @@ def download_and_parse_rdd2022(
                         }
                     )
                 except Exception:
-                    # Retain the XML record even if a preview image is malformed.
                     pass
 
             if progress_callback:
@@ -607,15 +723,22 @@ def download_and_parse_rdd2022(
             "records_loaded": len(docs),
             "class_counts": dict(total_class_counts),
             "archive_size_gb": remote_zip.size / (1024 ** 3),
+            "country_zip_size_mb": country_zip_info.file_size / (1024 ** 2),
             "source_url": file_metadata["download_url"],
             "source_file": file_metadata["name"],
-            "source": "Figshare HTTP range access",
+            "country_zip_file": country_zip_info.filename,
+            "access_mode": access_mode,
+            "source": "Figshare nested country ZIP",
         }
         return docs, previews, stats
 
     finally:
-        if archive is not None:
-            archive.close()
+        if country_archive is not None:
+            country_archive.close()
+        if country_archive_backing is not None:
+            country_archive_backing.close()
+        if outer_archive is not None:
+            outer_archive.close()
         if remote_zip is not None:
             remote_zip.close()
 
@@ -794,16 +917,8 @@ def graph_evidence_for_hits(graph: nx.Graph, metadatas: list[dict[str, Any]]) ->
     return evidence
 
 # -----------------------------------------------------------------------------
-# Retrieval, prompt construction and LLM / transparent fallback generation
+# Retrieval and local evidence-grounded response generation
 # -----------------------------------------------------------------------------
-
-
-def get_openai_key() -> str | None:
-    try:
-        secret = st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        secret = ""
-    return secret or os.getenv("OPENAI_API_KEY") or None
 
 
 def retrieve_context(collection, graph: nx.Graph, query: str, top_k: int):
@@ -825,73 +940,38 @@ def retrieve_context(collection, graph: nx.Graph, query: str, top_k: int):
     return hits, graph_lines
 
 
-def generate_answer(query: str, hits: list[dict[str, Any]], graph_lines: list[str], model_name: str):
-    context_blocks = []
-    for index, hit in enumerate(hits, start=1):
-        meta = hit["metadata"]
-        label = meta.get("title") or meta.get("source_id") or f"Chunk {index}"
-        context_blocks.append(f"[Evidence {index}: {label} | {meta.get('country', 'Not specified')} | {meta.get('doc_type', 'Document')}]\n{hit['text']}")
-    graph_context = "\n".join(f"- {line}" for line in graph_lines) or "No direct graph-neighbour relationships were found for the retrieved chunks."
-    context = "\n\n".join(context_blocks)
-    prompt = f"""You are RoadGraph AI, an evidence-grounded assistant for road damage and maintenance research.
-Answer the user's question using only the retrieved evidence and graph relationships below.
-Do not invent road locations, incident links, severity ratings, repair completion, or engineering recommendations not present in the evidence.
-If evidence is insufficient, state what is missing. Distinguish RDD2022 image annotations from general domain reference text.
-Give a concise answer followed by a short 'Evidence used' section.
-
-USER QUESTION:
-{query}
-
-RETRIEVED DOCUMENT CHUNKS:
-{context}
-
-KNOWLEDGE GRAPH NEIGHBOURS:
-{graph_context}
-"""
-
-    api_key = get_openai_key()
-    if api_key:
-        try:
-            from openai import OpenAI
-
-            client = OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model=model_name or "gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Answer only from supplied evidence. Be precise and transparent about limitations."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-            )
-            answer = response.choices[0].message.content or "The model returned an empty response."
-            return answer, "OpenAI LLM generation"
-        except Exception as exc:
-            return (
-                "LLM generation failed, so the app is showing a retrieval-grounded fallback instead.\n\n"
-                + _fallback_answer(hits, graph_lines)
-                + f"\n\nTechnical detail: {type(exc).__name__}: {exc}",
-                "Extractive fallback (LLM call failed)",
-            )
-
-    return _fallback_answer(hits, graph_lines), "Extractive fallback (no OPENAI_API_KEY configured)"
-
-
-def _fallback_answer(hits: list[dict[str, Any]], graph_lines: list[str]) -> str:
+def generate_answer(query: str, hits: list[dict[str, Any]], graph_lines: list[str]):
+    """Build an evidence-grounded response locally, without an external API."""
     if not hits:
-        return "I could not retrieve relevant evidence for this question. Try a road-damage class such as pothole, longitudinal crack, transverse crack or alligator crack."
-    snippets = []
-    for hit in hits[:4]:
+        return (
+            "I could not retrieve relevant evidence for this question. Try a road-damage class "
+            "such as pothole, longitudinal crack, transverse crack or alligator crack.",
+            "Local evidence-based response (no API required)",
+        )
+
+    answer_parts = [
+        f"**Question:** {query}",
+        "The following response is assembled from the highest-ranked retrieved text chunks. "
+        "It is an extractive, evidence-grounded response rather than an externally generated LLM answer.",
+    ]
+    for index, hit in enumerate(hits[:4], start=1):
         meta = hit["metadata"]
-        title = meta.get("title") or meta.get("source_id") or "Retrieved record"
-        snippets.append(f"**{title}:** {hit['text'][:650]}")
-    graph_text = "\n".join(f"- {line}" for line in graph_lines[:12]) or "- No linked graph categories were retrieved."
-    return (
-        "The following is a retrieval-based summary of the available evidence. "
-        "It is not an LLM-generated interpretation.\n\n"
-        + "\n\n".join(snippets)
-        + "\n\n**Related Knowledge Graph evidence**\n"
-        + graph_text
+        title = meta.get("title") or meta.get("source_id") or f"Retrieved record {index}"
+        doc_type = meta.get("doc_type", "Document")
+        country = meta.get("country", "Not specified")
+        answer_parts.append(
+            f"**Evidence {index} — {title}** ({doc_type}; {country})\n{hit['text'][:900]}"
+        )
+
+    graph_text = "\n".join(f"- {line}" for line in graph_lines[:12])
+    answer_parts.append(
+        "**Knowledge Graph relationships**\n" + (graph_text if graph_text else "No direct graph-neighbour relationships were retrieved.")
     )
+    answer_parts.append(
+        "**Limitations:** The retrieved sample is not a complete road survey. The annotations do not by themselves establish "
+        "geographic location, damage severity, repair priority or engineering approval."
+    )
+    return "\n\n".join(answer_parts), "Local evidence-based response (no API required)"
 
 # -----------------------------------------------------------------------------
 # Graph visualisation
@@ -995,8 +1075,8 @@ def render_pipeline_status(built: bool):
         "6. User query",
         "7. Similarity search",
         "8. Top-k retrieved chunks",
-        "9. Prompt construction with graph evidence",
-        "10. LLM-based generation (API key required)",
+        "9. Evidence assembly with graph relationships",
+        "10. Evidence-grounded answer generation (local)",
     ]
     columns = st.columns(5)
     for index, label in enumerate(steps):
@@ -1023,7 +1103,7 @@ def safe_rerun():
 st.title("RoadGraph AI")
 st.subheader("An ontology-guided GraphRAG prototype for road damage and maintenance")
 st.caption("RDD2022 annotations + domain knowledge → vector retrieval + Knowledge Graph → evidence-grounded answers")
-st.caption("Parser build: 2026-11-15 | country-path and Pascal VOC filename matching")
+st.caption("Parser build: 2026-11-15 | nested country ZIP + Pascal VOC pairing")
 
 with st.sidebar:
     st.header("Build the knowledge base")
@@ -1031,7 +1111,7 @@ with st.sidebar:
         "RDD2022 country subset",
         list(COUNTRY_ARCHIVES.keys()),
         index=0,
-        help="The app reads only the selected country training files from the official Figshare ZIP using HTTP byte-range requests. It does not download the full archive.",
+        help="The app opens only the selected country ZIP nested inside the official Figshare archive. It does not download the full 13+ GB archive.",
     )
     max_images = st.slider(
         "Maximum annotated images to ingest",
@@ -1048,24 +1128,20 @@ with st.sidebar:
         help="Uploaded files are processed in the running app session and are not committed to GitHub.",
     )
     st.divider()
-    st.subheader("LLM configuration")
-    model_name = st.text_input("OpenAI chat model", value="gpt-4o-mini")
-    if get_openai_key():
-        st.success("OpenAI API key detected")
-    else:
-        st.info("No OpenAI key detected. Retrieval and graph search still work with an extractive fallback. Add OPENAI_API_KEY in Streamlit Secrets for LLM generation.")
+    st.subheader("Answer generation")
+    st.info("No API key is required. Answers are assembled locally from retrieved chunks and Knowledge Graph evidence.")
     st.divider()
     build_clicked = st.button("Load RDD2022 & build app", type="primary", use_container_width=True)
-    st.caption("Cloud storage note: only selected ZIP byte ranges are read; the 13+ GB source archive is not downloaded in full. Chroma uses in-memory storage.")
+    st.caption("Cloud storage note: the 13+ GB combined archive is not downloaded. Only the selected country ZIP is accessed; Chroma uses in-memory storage.")
 
 if build_clicked:
     download_bar = st.progress(0.0, text="Connecting to the Figshare RDD2022 archive...")
     try:
-        with st.spinner("Reading selected-country XML/JPEG records from the remote RDD2022 ZIP..."):
+        with st.spinner("Opening the selected country ZIP and reading training XML/JPEG pairs..."):
             rdd_records, image_previews, dataset_stats = download_and_parse_rdd2022(
                 selected_archive,
                 max_images,
-                progress_callback=lambda value: download_bar.progress(value, text=f"Reading selected records: {value * 100:.0f}%"),
+                progress_callback=lambda value: download_bar.progress(value, text=f"Parsing selected-country training records: {value * 100:.0f}%"),
             )
         download_bar.progress(1.0, text="Selected RDD2022 records loaded.")
         uploaded_records = read_uploaded_documents(uploaded_files)
@@ -1086,7 +1162,6 @@ if build_clicked:
         st.session_state["collection"] = collection
         st.session_state["collection_name"] = collection_name
         st.session_state["knowledge_graph"] = graph
-        st.session_state["model_name"] = model_name
         st.session_state["built"] = True
         st.session_state["chat_history"] = []
         st.success("Knowledge base, vector index and Knowledge Graph built successfully.")
@@ -1106,7 +1181,7 @@ if not built:
     overview_cols[2].metric("Damage categories", "4", help="D00, D10, D20 and D40 used by the CRDDC 2022 challenge.")
     st.markdown("### What this app will build")
     st.markdown(
-        "- **Dataset ingestion:** reads selected-country training XML/JPEG entries from the official Figshare ZIP using HTTP byte-range requests.\n"
+        "- **Dataset ingestion:** opens the selected nested country ZIP inside the official Figshare archive and reads its paired training JPEG/XML records.\n"
         "- **Text corpus:** converts each Pascal VOC image annotation into searchable text and adds road-damage reference documents.\n"
         "- **Vector retrieval:** chunks the corpus, generates embeddings and stores them in an ephemeral Chroma vector database.\n"
         "- **Knowledge Graph:** connects RDD2022 image records and domain documents to damage-category nodes.\n"
@@ -1134,8 +1209,8 @@ metric_cols[2].metric("Vector records", f"{collection.count():,}")
 metric_cols[3].metric("Graph nodes", f"{graph.number_of_nodes():,}")
 metric_cols[4].metric("Graph edges", f"{graph.number_of_edges():,}")
 st.caption(
-    f"Dataset subset: {dataset_stats['country']} | Source archive: {dataset_stats['archive_size_gb']:.2f} GB (range-read) | "
-    f"The app ingested {len(rdd_records)} XML-annotated training image records, not the entire dataset."
+    f"Dataset subset: {dataset_stats['country']} | Country ZIP: {dataset_stats['country_zip_size_mb']:.1f} MB | "
+    f"The app ingested {len(rdd_records)} XML-annotated training image records from {dataset_stats['country_zip_file']}."
 )
 
 tabs = st.tabs(["Overview", "RAG Chatbot", "Knowledge Graph", "RDD2022 Explorer", "RAG Pipeline & Sources"])
@@ -1173,7 +1248,7 @@ with tabs[0]:
 # RAG chatbot tab
 with tabs[1]:
     st.markdown("### Ask a question over RDD2022 and road-maintenance knowledge")
-    st.caption("The chatbot uses top-k vector retrieval plus graph-neighbour evidence. Add OPENAI_API_KEY in Streamlit Secrets to enable LLM response generation.")
+    st.caption("The chatbot uses top-k vector retrieval plus graph-neighbour evidence. Response synthesis runs locally; no API key is needed.")
     query_col, k_col = st.columns([4, 1])
     with query_col:
         query = st.text_input(
@@ -1190,7 +1265,7 @@ with tabs[1]:
         else:
             with st.spinner("Searching the vector database and expanding Knowledge Graph relationships..."):
                 hits, graph_lines = retrieve_context(collection, graph, query.strip(), int(top_k))
-                answer, generation_mode = generate_answer(query.strip(), hits, graph_lines, model_name)
+                answer, generation_mode = generate_answer(query.strip(), hits, graph_lines)
                 st.session_state["last_rag_result"] = {
                     "query": query.strip(),
                     "hits": hits,
@@ -1288,15 +1363,15 @@ with tabs[4]:
     st.markdown("### Mapping the implementation to the 10 RAG stages")
     pipeline_rows = [
         ("1. Domain Documents / Knowledge Base", "Built-in road-damage reference records for D00, D10, D20 and D40, plus optional user PDF/TXT files."),
-        ("2. Document Loading", "The app reads paired JPEG/Pascal VOC XML training records for the selected country from the official Figshare ZIP using HTTP byte-range requests, and extracts text from uploaded PDFs/TXT files."),
+        ("2. Document Loading", "The app opens the selected country ZIP nested inside the Figshare archive, pairs training JPEG files with Pascal VOC XML annotations, and extracts text from uploaded PDFs/TXT files."),
         ("3. Text Chunking and Pre-processing", "LangChain RecursiveCharacterTextSplitter creates 760-character chunks with 110-character overlap."),
         ("4. Embedding Generation", "Chroma's default embedding function generates dense all-MiniLM-L6-v2 sentence embeddings using ONNX Runtime."),
         ("5. Vector Database Storage", "Chunks, embeddings and metadata are stored in an ephemeral in-memory Chroma collection."),
         ("6. User Query", "The user enters a natural-language road-damage or maintenance question in the chatbot."),
         ("7. Similarity Search / Retrieval", "Chroma performs cosine-distance vector retrieval over the embedded chunks."),
         ("8. Top-k Relevant Chunks", "The interface displays the selected top-k text chunks, source metadata and vector distance."),
-        ("9. Prompt Construction using Retrieved Context", "The retrieved chunks are combined with one-hop Knowledge Graph relationships to construct an evidence-grounded prompt."),
-        ("10. LLM-based Generation", "When OPENAI_API_KEY is configured, the app calls the selected OpenAI chat model. Without a key, it shows a clearly labelled extractive retrieval fallback."),
+        ("9. Evidence Assembly", "The retrieved top-k chunks and one-hop Knowledge Graph relationships are assembled into a source-labelled evidence context for response generation."),
+        ("10. Evidence-grounded Answer Generation", "The app assembles a local response from retrieved chunks and Knowledge Graph relationships. No external LLM API key or paid service is required; this is an extractive response, not a generative LLM call."),
     ]
     for title, description in pipeline_rows:
         with st.expander(title, expanded=False):
@@ -1305,7 +1380,7 @@ with tabs[4]:
     st.markdown("### Data source and scope")
     st.markdown(
         f"- Official RDD2022 repository and dataset details: [{DATASET_SOURCE}]({DATASET_SOURCE})\n"
-        "- The public Figshare ZIP is accessed with HTTP byte-range requests; only selected country training files are fetched when the user builds the app.\n"
+        "- The public Figshare archive contains nested country ZIP files; the app opens only the selected country ZIP and reads labelled training pairs from it.\n"
         "- The app uses a capped sample of annotated training image/XML pairs, not the entire 47,420-image collection.\n"
         "- Test images without labels are not used as labelled retrieval evidence.\n"
         "- The image labels are ground-truth dataset annotations, not predictions made by a newly trained computer-vision model.\n"
@@ -1313,7 +1388,7 @@ with tabs[4]:
     )
     st.markdown("### Runtime and storage")
     st.write(
-        "The combined Figshare ZIP is not downloaded in full; only selected XML/JPEG byte ranges are fetched and held temporarily in memory while parsing. "
+        "The combined Figshare ZIP is not downloaded in full. The selected country ZIP is opened using byte-range access when possible; if its outer ZIP member is compressed, only that country ZIP is temporarily spooled. "
         "The Chroma collection and graph are held in server memory for the current running app session. "
         "No dataset archive or vector database is written to the user's computer or committed to GitHub. "
         "A Streamlit restart clears the in-memory index, so the user may need to build it again."
